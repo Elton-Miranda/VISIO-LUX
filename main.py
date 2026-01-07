@@ -2,9 +2,16 @@ import os
 import logging
 import re
 import edge_tts
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler
+)
 from groq import Groq
 from dotenv import load_dotenv
 import prompts
@@ -29,16 +36,19 @@ logging.basicConfig(
 
 VOZ_NEURAL = "pt-BR-AntonioNeural"
 
+# DEFININDO OS ESTADOS DA CONVERSA (PASSOS DO FORMULÁRIO)
+TOPOLOGIA, SINAL, LOCAL, DESCRICAO = range(4)
+
 # ==============================================================================
 # 2. FUNÇÕES AUXILIARES
 # ==============================================================================
 
 def limpar_markdown(texto):
     """Remove caracteres especiais para o áudio ficar natural."""
-    texto_limpo = re.sub(r'\*+', '', texto) # Tira negrito
-    texto_limpo = re.sub(r'\#+', '', texto_limpo) # Tira titulos
-    texto_limpo = re.sub(r'_+', '', texto_limpo) # Tira italico
-    texto_limpo = re.sub(r'^- ', '', texto_limpo, flags=re.MULTILINE) # Tira hifens de lista
+    texto_limpo = re.sub(r'\*+', '', texto)
+    texto_limpo = re.sub(r'\#+', '', texto_limpo)
+    texto_limpo = re.sub(r'_+', '', texto_limpo)
+    texto_limpo = re.sub(r'^- ', '', texto_limpo, flags=re.MULTILINE)
     return texto_limpo
 
 def transcrever_audio(caminho_arquivo):
@@ -56,33 +66,27 @@ def transcrever_audio(caminho_arquivo):
         return None
 
 async def gerar_e_enviar_audio(context, chat_id, texto, user_id):
-    """Gera o áudio e envia (usado apenas quando o técnico manda áudio)."""
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
-        
-        # Limpa o texto e gera o arquivo
         texto_limpo = limpar_markdown(texto)
         arquivo_saida = f"resposta_{user_id}.mp3"
         communicate = edge_tts.Communicate(texto_limpo, VOZ_NEURAL)
         await communicate.save(arquivo_saida)
         
-        # Envia
         with open(arquivo_saida, 'rb') as audio:
             await context.bot.send_voice(chat_id=chat_id, voice=audio)
-            
     except Exception as e:
         logging.error(f"Erro no envio de áudio: {e}")
     finally:
-        # Limpeza do arquivo
         if os.path.exists(arquivo_saida):
             os.remove(arquivo_saida)
 
-def consultar_lumen(texto_usuario):
+def consultar_lumen(texto_completo):
     try:
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": prompts.SYSTEM_PROMPT},
-                {"role": "user", "content": texto_usuario}
+                {"role": "user", "content": texto_completo}
             ],
             model="llama-3.3-70b-versatile",
             temperature=0.2,
@@ -93,75 +97,131 @@ def consultar_lumen(texto_usuario):
         return "⚠️ Erro no sistema de inteligência."
 
 # ==============================================================================
-# 3. HANDLERS (A LÓGICA DE ESPELHAMENTO)
+# 3. FLUXO DE CONVERSA (PASSO A PASSO)
 # ==============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    msg = (
-        f"⚡ **Olá, {user_name}! Sou o Lúmen.**\n\n"
-        "**Como eu funciono:**\n"
-        "📝 Se você **escrever**, eu respondo em texto (para locais barulhentos).\n"
-        "🗣️ Se você mandar **áudio**, eu respondo em áudio e texto.\n\n"
-        "Pode mandar seu cenário!"
+    """Inicia o diagnóstico."""
+    user = update.effective_user.first_name
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"👷 **Olá, {user}! Vamos iniciar o diagnóstico.**\n\nVou te fazer 4 perguntas rápidas para entender o problema.\n\n📍 **1. Qual é a Topologia da Rede?**",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup([['Barramento', 'Balanceada (Splitter)']], one_time_keyboard=True)
     )
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='Markdown')
+    return TOPOLOGIA
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    CENÁRIO 1: Técnico escreve.
-    AÇÃO: Bot responde APENAS TEXTO (Ideal para ruído/sigilo).
-    """
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+async def receber_topologia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda a topologia e pergunta o sinal."""
+    context.user_data['topologia'] = update.message.text
     
-    # 1. Processa a resposta
-    resposta = consultar_lumen(update.message.text)
-    
-    # 2. Envia APENAS texto
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=resposta)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📶 **2. Qual nível de sinal (dBm) você mediu?**\n(Digite apenas o número, ex: -28)",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardRemove() # Remove os botões anteriores
+    )
+    return SINAL
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    CENÁRIO 2: Técnico manda áudio.
-    AÇÃO: Bot responde TEXTO + ÁUDIO (Ideal para mãos ocupadas).
-    """
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="🎧 _Ouvindo..._", parse_mode='Markdown')
+async def receber_sinal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda o sinal e pergunta o local."""
+    context.user_data['sinal'] = update.message.text
     
-    file_info = await context.bot.get_file(update.message.voice.file_id)
-    caminho = f"audio_{update.message.from_user.id}.ogg"
-    await file_info.download_to_drive(caminho)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🏠 **3. Onde você está medindo?**",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup([['CTO', 'Roseta/PTO', 'ONU', 'Cabo Drop']], one_time_keyboard=True)
+    )
+    return LOCAL
 
-    try:
-        texto_usuario = transcrever_audio(caminho)
-        
-        if texto_usuario:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"📝 *Entendi:* \"{texto_usuario}\"", parse_mode='Markdown')
-            
-            # 1. Processa a resposta
-            resposta = consultar_lumen(texto_usuario)
-            
-            # 2. Envia TEXTO (Referência visual)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=resposta)
-            
-            # 3. Envia ÁUDIO (Explicação falada)
-            await gerar_e_enviar_audio(context, update.effective_chat.id, resposta, update.effective_user.id)
-            
-        else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Não consegui entender o áudio.")
-            
-    finally:
-        if os.path.exists(caminho):
-            os.remove(caminho)
+async def receber_local(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda o local e pede a descrição final."""
+    context.user_data['local'] = update.message.text
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📝 **4. Descreva o problema ou mande um ÁUDIO explicando o cenário.**",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return DESCRICAO
+
+async def finalizar_diagnostico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Coleta tudo, manda pra IA e encerra."""
+    chat_id = update.effective_chat.id
+    
+    # Verifica se o último passo foi áudio ou texto
+    if update.message.voice:
+        await context.bot.send_message(chat_id=chat_id, text="🎧 _Processando seu áudio..._", parse_mode='Markdown')
+        file_info = await context.bot.get_file(update.message.voice.file_id)
+        caminho = f"audio_{update.message.from_user.id}.ogg"
+        await file_info.download_to_drive(caminho)
+        descricao = transcrever_audio(caminho) or "Áudio inaudível"
+        if os.path.exists(caminho): os.remove(caminho)
+        usou_audio = True
+    else:
+        descricao = update.message.text
+        usou_audio = False
+
+    # Monta o dossiê para a IA
+    dados = context.user_data
+    prompt_final = (
+        f"DADOS DO TÉCNICO:\n"
+        f"- Topologia: {dados.get('topologia')}\n"
+        f"- Sinal Medido: {dados.get('sinal')}\n"
+        f"- Local da Medição: {dados.get('local')}\n"
+        f"- Relato do Problema: {descricao}\n\n"
+        f"Com base nisso, qual o diagnóstico e solução?"
+    )
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    
+    # Consulta o Lúmen
+    resposta = consultar_lumen(prompt_final)
+    
+    # Envia Texto
+    await context.bot.send_message(chat_id=chat_id, text=resposta)
+    
+    # Envia Áudio (se o técnico usou áudio ou se preferir sempre mandar)
+    # Aqui configurei para mandar áudio se o técnico mandou áudio OU se a resposta for longa
+    if usou_audio: 
+        await gerar_e_enviar_audio(context, chat_id, resposta, update.effective_user.id)
+
+    # Limpa a memória
+    context.user_data.clear()
+    
+    await context.bot.send_message(chat_id=chat_id, text="✅ **Atendimento finalizado.** Digite /start para novo diagnóstico.", parse_mode='Markdown')
+    
+    return ConversationHandler.END
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela o processo."""
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Diagnóstico cancelado. Digite /start para recomeçar.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
 # ==============================================================================
-# 4. START
+# 4. START (SETUP DO CONVERSATION HANDLER)
 # ==============================================================================
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Configura a máquina de estados
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            TOPOLOGIA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_topologia)],
+            SINAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_sinal)],
+            LOCAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_local)],
+            DESCRICAO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, finalizar_diagnostico),
+                MessageHandler(filters.VOICE, finalizar_diagnostico)
+            ],
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar)]
+    )
 
-    print("✅ VISIO LUX ESTÁ ON!")
+    application.add_handler(conv_handler)
+
+    print("✅ LUX está ON!")
     application.run_polling()
